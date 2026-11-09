@@ -367,13 +367,15 @@ class StateTests(unittest.TestCase):
 class MainTests(unittest.TestCase):
     ENV = {"ROBLOX_API_KEY": "key", "TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "1"}
 
-    def run_main(self, argv, env=None, campaigns=None, error=None, telegram_error=None):
+    def run_main(self, argv, env=None, campaigns=None, error=None, telegram_error=None, failing_chat=None):
         sent = []
+        self.chats = []
 
         def fake_send(token, chat_id, text, **_):
-            if telegram_error:
+            if telegram_error and (failing_chat is None or chat_id == failing_chat):
                 raise telegram_error
             sent.append(text)
+            self.chats.append(chat_id)
 
         def fake_list(session, group_id=None, **_):
             self.assertEqual(session.headers["x-api-key"], "key")
@@ -449,6 +451,36 @@ class MainTests(unittest.TestCase):
             self.assertEqual(sent, [])
             self.assertIn("Sky Tycoon", output)
             self.assertFalse(state.exists())
+
+    def test_sends_to_every_chat_in_the_list(self):
+        env = dict(self.ENV, TELEGRAM_CHAT_ID=" 111 ,222,111, ")
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder) / "snapshot.json"
+            code, sent, _ = self.run_main(["--state-file", str(state)], env=env, campaigns=self.sample())
+            self.assertEqual(code, 0)
+            self.assertEqual(self.chats, ["111", "222"])  # trimmed, duplicate dropped
+            self.assertEqual(sent[0], sent[1])
+            self.assertTrue(state.exists())
+
+    def test_one_failing_chat_does_not_block_the_other(self):
+        env = dict(self.ENV, TELEGRAM_CHAT_ID="111,222")
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder) / "snapshot.json"
+            code, _, _ = self.run_main(
+                ["--state-file", str(state)],
+                env=env,
+                campaigns=self.sample(),
+                telegram_error=bot.TelegramError("HTTP 403 Forbidden: bot can't initiate conversation"),
+                failing_chat="111",
+            )
+            self.assertEqual(self.chats, ["222"])  # the second chat still got the report
+            self.assertEqual(code, 1)  # but the run is marked failed
+            self.assertFalse(state.exists())  # and the next run retries any alert
+
+    def test_parse_chat_ids(self):
+        self.assertEqual(bot.parse_chat_ids("911893965"), ["911893965"])
+        self.assertEqual(bot.parse_chat_ids("1, -1002, 1"), ["1", "-1002"])
+        self.assertEqual(bot.parse_chat_ids(" , "), [])
 
     def test_missing_telegram_settings_fail_fast(self):
         code, sent, _ = self.run_main([], env={"ROBLOX_API_KEY": "key"})

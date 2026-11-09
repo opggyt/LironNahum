@@ -8,7 +8,7 @@ Actions, but works the same from a local shell.
 Secrets come only from environment variables:
     ROBLOX_API_KEY      Open Cloud API key with the ad.campaign:read operation
     TELEGRAM_BOT_TOKEN  token from @BotFather
-    TELEGRAM_CHAT_ID    chat that receives the report
+    TELEGRAM_CHAT_ID    chat(s) that receive the report, comma-separated
 Optional:
     ROBLOX_GROUP_ID     list a group's ads account instead of the personal one
     STATE_FILE          where the snapshot is kept (default: state/snapshot.json)
@@ -833,15 +833,34 @@ def load_dotenv_file(path: Path) -> None:
             os.environ[key] = value
 
 
-def deliver(messages: list[str], *, dry_run: bool, token: str, chat_id: str) -> None:
+def parse_chat_ids(value: str) -> list[str]:
+    """TELEGRAM_CHAT_ID may hold several chats: "111, 222" -> ["111", "222"]."""
+    chat_ids = []
+    for part in value.split(","):
+        part = part.strip()
+        if part and part not in chat_ids:
+            chat_ids.append(part)
+    return chat_ids
+
+
+def deliver(messages: list[str], *, dry_run: bool, token: str, chat_ids: list[str]) -> None:
+    """Send to every chat. One chat failing doesn't stop the others; the
+    failure is raised at the end so the run still shows up as failed."""
     if dry_run:
         for index, message in enumerate(messages, 1):
             print(f"----- message {index}/{len(messages)} ({tg_len(message)} chars) -----")
             print(message)
-        print("----- dry run: nothing was sent -----")
+        print(f"----- dry run: nothing was sent (would go to {len(chat_ids)} chat(s)) -----")
         return
-    for message in messages:
-        send_telegram(token, chat_id, message)
+    failures = []
+    for chat_id in chat_ids:
+        try:
+            for message in messages:
+                send_telegram(token, chat_id, message)
+        except TelegramError as error:
+            failures.append(f"chat {chat_id}: {error}")
+    if failures:
+        raise TelegramError("; ".join(failures))
 
 
 def _load_demo(with_metrics: bool) -> tuple[list[Campaign], Snapshot | None]:
@@ -877,8 +896,8 @@ def main(argv=None) -> int:
     load_dotenv_file(BASE_DIR / ".env")
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    if not args.dry_run and not (token and chat_id):
+    chat_ids = parse_chat_ids(os.environ.get("TELEGRAM_CHAT_ID", ""))
+    if not args.dry_run and not (token and chat_ids):
         print("error: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set (or use --dry-run)", file=sys.stderr)
         return 2
 
@@ -886,7 +905,7 @@ def main(argv=None) -> int:
     now = datetime.now(timezone.utc)
 
     def send(messages: list[str]) -> None:
-        deliver(messages, dry_run=args.dry_run, token=token, chat_id=chat_id)
+        deliver(messages, dry_run=args.dry_run, token=token, chat_ids=chat_ids)
 
     try:
         if demo:
