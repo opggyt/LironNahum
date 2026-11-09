@@ -31,7 +31,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -126,6 +126,7 @@ class Campaign:
     budget_micros: int | None = None
     scheduled_budget_micros: int | None = None
     scheduled_effective_time: str | None = None
+    target_universe_id: str | None = None
     metrics: Metrics | None = None
 
 
@@ -146,6 +147,32 @@ class RobloxApiError(Exception):
 
 class TelegramError(Exception):
     pass
+
+
+class AnalyticsError(Exception):
+    """A game-stats query failed. str() is short and safe to show in Telegram."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass
+class DailyValue:
+    day: date  # the UTC day the value belongs to
+    value: float
+    previous: float | None  # the day before, when Roblox returned it
+    projected: bool = False
+
+
+@dataclass
+class GameStats:
+    """Whole-experience daily numbers from the Analytics API (all traffic, not only ads)."""
+
+    universe_id: str
+    campaign_names: list[str]
+    values: dict[str, DailyValue] = field(default_factory=dict)
+    error: AnalyticsError | None = None
 
 
 # --------------------------------------------------------------------------
@@ -350,6 +377,113 @@ def fetch_campaign_metrics(session, campaigns: list[Campaign]) -> dict[str, Metr
     return {}
 
 
+# --------------------------------------------------------------------------
+# Analytics Query API: whole-experience daily numbers (read-only)
+# --------------------------------------------------------------------------
+
+ANALYTICS_BASE = "https://apis.roblox.com/analytics-query-api"
+# (metric, emoji, Hebrew label). All support OneDay granularity.
+GAME_METRICS = (
+    ("DailyActiveUsers", "👥", "משתמשים פעילים (DAU)"),
+    ("UniqueUsersWithImpressions", "👁", "ראו את המשחק (impressions)"),
+    ("UniqueUsersWithClicks", "🖱", "נכנסו לדף המשחק (clicks)"),
+    ("UniqueUsersWithPlaySessions", "🎮", "שיחקו (plays)"),
+)
+ANALYTICS_LOOKBACK_DAYS = 4  # enough to find the latest finished day and the one before it
+MAX_POLLS = 15
+POLL_INTERVAL = 2.0
+
+
+def _analytics_call(session, method: str, url: str, *, sleep, **kwargs) -> dict:
+    try:
+        resp, _ = request_with_retry(session, method, url, sleep=sleep, **kwargs)
+    except requests.RequestException as exc:
+        raise AnalyticsError(f"תקלת רשת ({type(exc).__name__})") from None
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if resp.status_code in (200, 202) and isinstance(body, dict):
+        return body
+    message = ""
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or "")
+        elif isinstance(body.get("errors"), list) and body["errors"] and isinstance(body["errors"][0], dict):
+            message = str(body["errors"][0].get("message") or "")
+    raise AnalyticsError(f"HTTP {resp.status_code} {message[:150]}".strip(), resp.status_code)
+
+
+def query_daily_metric(session, universe_id: str, metric: str, start: datetime, end: datetime,
+                       *, sleep=time.sleep) -> list[tuple[date, float, bool]]:
+    """One metric at OneDay granularity: [(day, value, projected), ...] sorted by day."""
+    url = f"{ANALYTICS_BASE}/v1/universes/{universe_id}/metrics"
+    body = {
+        "metric": metric,
+        "granularity": "OneDay",
+        "startTime": start.isoformat().replace("+00:00", "Z"),
+        "endTime": end.isoformat().replace("+00:00", "Z"),
+    }
+    data = _analytics_call(session, "POST", url, json=body, sleep=sleep)
+    for poll in range(MAX_POLLS + 1):  # long queries come back as 202 + a path to poll
+        if data.get("done"):
+            break
+        if poll == MAX_POLLS:
+            raise AnalyticsError("השאילתה לא הסתיימה בזמן")
+        path = str(data.get("path") or "").lstrip("/")
+        if not path:
+            raise AnalyticsError("תשובה לא צפויה (אין path)")
+        sleep(POLL_INTERVAL)
+        data = _analytics_call(session, "GET", f"{ANALYTICS_BASE}/{path}", sleep=sleep)
+    error = data.get("error")
+    if isinstance(error, dict):
+        raise AnalyticsError(str(error.get("message") or "השאילתה נכשלה")[:150])
+
+    points: dict[date, tuple[float, bool]] = {}
+    for series in (data.get("response") or {}).get("values") or []:
+        for point in series.get("dataPoints") or []:
+            day = datetime.fromisoformat(str(point["time"]).replace("Z", "+00:00")).date()
+            points[day] = (float(point["value"]), point.get("status") == "Projected")
+    return [(day, value, projected) for day, (value, projected) in sorted(points.items())]
+
+
+def fetch_game_stats(session, campaigns: list[Campaign], now: datetime, *, sleep=time.sleep) -> list[GameStats]:
+    """Daily DAU / impressions / clicks / plays for each experience an active campaign promotes.
+
+    A failure here (for example a key without universe.analytics:read) is kept
+    on the GameStats and shown in the report; it never stops the campaign report.
+    """
+    universes: dict[str, GameStats] = {}
+    for campaign in campaigns:
+        if is_reportable(campaign) and campaign.target_universe_id:
+            stats = universes.setdefault(
+                campaign.target_universe_id, GameStats(campaign.target_universe_id, [])
+            )
+            stats.campaign_names.append(campaign.name)
+
+    end = datetime.combine(now.astimezone(timezone.utc).date(), dtime.min, tzinfo=timezone.utc)
+    start = end - timedelta(days=ANALYTICS_LOOKBACK_DAYS)
+    for stats in universes.values():
+        for metric, _, _ in GAME_METRICS:
+            try:
+                points = query_daily_metric(session, stats.universe_id, metric, start, end, sleep=sleep)
+            except AnalyticsError as error:
+                stats.error = error
+                break  # same key, same experience: the other metrics would fail the same way
+            except (KeyError, TypeError, ValueError, AttributeError):
+                stats.error = AnalyticsError("תשובה לא צפויה מה-Analytics API")
+                break
+            if not points:
+                continue
+            day, value, projected = points[-1]
+            previous = None
+            if len(points) > 1 and points[-2][0] == day - timedelta(days=1):
+                previous = points[-2][1]
+            stats.values[metric] = DailyValue(day, value, previous, projected)
+    return list(universes.values())
+
+
 def parse_campaign(raw: dict) -> Campaign:
     budget = raw.get("budget") if isinstance(raw.get("budget"), dict) else {}
     reasons = raw.get("deliveryStatusReasons")
@@ -363,6 +497,7 @@ def parse_campaign(raw: dict) -> Campaign:
         budget_micros=parse_micros(budget.get("amountMicros")),
         scheduled_budget_micros=parse_micros(budget.get("scheduledAmountMicros")),
         scheduled_effective_time=budget.get("scheduledEffectiveTime") or None,
+        target_universe_id=str(raw["targetUniverseId"]) if raw.get("targetUniverseId") else None,
     )
 
 
@@ -673,8 +808,48 @@ def _summary_block(shown: list[Campaign], hidden: int, previous: Snapshot | None
     return "\n".join(lines)
 
 
+def _fmt_count(value: float) -> str:
+    return f"{int(value):,}" if value == int(value) else f"{value:,.1f}"
+
+
+def _game_block(stats: GameStats) -> str:
+    lines = ["🎮 <b>נתוני המשחק</b> · " + esc(", ".join(stats.campaign_names))]
+    if stats.error is not None:
+        lines.append(f"⚠️ לא זמין: {esc(stats.error)}")
+        if stats.error.status in (401, 403):
+            lines.append("💡 צריך להוסיף ל-API key את universe.analytics:read למשחק הזה.")
+        return "\n".join(lines)
+    if not stats.values:
+        lines.append("אין עדיין נתונים לימים האחרונים.")
+        return "\n".join(lines)
+
+    latest = max(v.day for v in stats.values.values())
+    lines.append(f"יום {latest.strftime('%d/%m/%Y')} (UTC):")
+    for metric, emoji, label in GAME_METRICS:
+        item = stats.values.get(metric)
+        if item is None:
+            continue
+        line = f"{emoji} {label}: {_fmt_count(item.value)}"
+        if item.previous is not None:
+            diff = item.value - item.previous
+            sign = "+" if diff > 0 else ("-" if diff < 0 else "±")
+            line += " (" + ltr(f"{sign}{_fmt_count(abs(diff))}") + " מהיום הקודם)"
+        if item.day != latest:
+            line += f" · נכון ל-{item.day.strftime('%d/%m')}"
+        if item.projected:
+            line += " · משוער"
+        lines.append(line)
+    lines.append("ℹ️ משתמשים ייחודיים מכל המקורות, לא רק מהפרסומת. מתעדכן פעם ביום.")
+    return "\n".join(lines)
+
+
 def build_report(
-    campaigns: list[Campaign], previous: Snapshot | None, now: datetime, *, demo: bool = False
+    campaigns: list[Campaign],
+    previous: Snapshot | None,
+    now: datetime,
+    *,
+    demo: bool = False,
+    game_stats: list[GameStats] | None = None,
 ) -> list[str]:
     """The report as a list of self-contained HTML blocks (see split_blocks)."""
     blocks = []
@@ -694,6 +869,7 @@ def build_report(
         blocks.extend(_campaign_block(c, previous) for c in shown)
     else:
         blocks.append("אין כרגע קמפיינים פעילים.")
+    blocks.extend(_game_block(stats) for stats in game_stats or [])
     blocks.append(_summary_block(shown, len(campaigns) - len(shown), previous, now))
     return blocks
 
@@ -863,7 +1039,7 @@ def deliver(messages: list[str], *, dry_run: bool, token: str, chat_ids: list[st
         raise TelegramError("; ".join(failures))
 
 
-def _load_demo(with_metrics: bool) -> tuple[list[Campaign], Snapshot | None]:
+def _load_demo(with_metrics: bool) -> tuple[list[Campaign], Snapshot | None, list[GameStats]]:
     raw = json.loads((SAMPLE_DIR / "campaigns.json").read_text(encoding="utf-8"))
     campaigns = [parse_campaign(item) for item in raw["campaigns"]]
     if with_metrics:
@@ -871,7 +1047,18 @@ def _load_demo(with_metrics: bool) -> tuple[list[Campaign], Snapshot | None]:
         for campaign in campaigns:
             campaign.metrics = metrics_from_dict(metrics.get(campaign.id))
     name = "previous_snapshot_with_metrics.json" if with_metrics else "previous_snapshot.json"
-    return campaigns, load_state(SAMPLE_DIR / name)
+    day = date(2026, 11, 8)
+    game_stats = [
+        GameStats("1111111111", ["Sky Tycoon - Winter Launch", "Pet Simulator Promo"], {
+            "DailyActiveUsers": DailyValue(day, 1350, 1200),
+            "UniqueUsersWithImpressions": DailyValue(day, 48210, 51000),
+            "UniqueUsersWithClicks": DailyValue(day, 2105, 2105),
+            "UniqueUsersWithPlaySessions": DailyValue(day, 1412, 1290, projected=True),
+        }),
+        GameStats("3333333333", ["Tower Defense Evergreen"],
+                  error=AnalyticsError("HTTP 403 Insufficient permissions", 403)),
+    ]
+    return campaigns, load_state(SAMPLE_DIR / name), game_stats
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -909,7 +1096,7 @@ def main(argv=None) -> int:
 
     try:
         if demo:
-            campaigns, previous = _load_demo(args.demo_metrics)
+            campaigns, previous, game_stats = _load_demo(args.demo_metrics)
         else:
             api_key = os.environ.get("ROBLOX_API_KEY", "").strip()
             if not api_key:
@@ -921,9 +1108,11 @@ def main(argv=None) -> int:
             metrics = fetch_campaign_metrics(session, campaigns)
             for campaign in campaigns:
                 campaign.metrics = metrics.get(campaign.id)
+            game_stats = fetch_game_stats(session, campaigns, now)
             previous = load_state(state_file)
 
-        send(split_blocks(build_report(campaigns, previous, now, demo=demo)))
+        report = build_report(campaigns, previous, now, demo=demo, game_stats=game_stats)
+        send(split_blocks(report))
         # Saved only after a successful send, so a failed delivery can't swallow an alert.
         if not args.dry_run and not demo:
             save_state(state_file, build_state(campaigns, now))

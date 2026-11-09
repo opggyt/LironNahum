@@ -13,7 +13,7 @@ import re
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -60,7 +60,8 @@ class FakeSession:
 
 
 def demo(with_metrics=False):
-    return bot._load_demo(with_metrics)
+    campaigns, previous, _ = bot._load_demo(with_metrics)
+    return campaigns, previous
 
 
 class MoneyTests(unittest.TestCase):
@@ -388,6 +389,7 @@ class MainTests(unittest.TestCase):
             mock.patch.dict(os.environ, self.ENV if env is None else env, clear=True),
             mock.patch.object(bot, "load_dotenv_file", lambda path: None),
             mock.patch.object(bot, "list_campaigns", fake_list),
+            mock.patch.object(bot, "fetch_game_stats", lambda *a, **k: []),
             mock.patch.object(bot, "send_telegram", fake_send),
             contextlib.redirect_stdout(out),
             contextlib.redirect_stderr(io.StringIO()),
@@ -488,12 +490,105 @@ class MainTests(unittest.TestCase):
         self.assertEqual(sent, [])
 
 
+def metric_response(points, done=True):
+    return {"done": done, "response": {"values": [{"breakdowns": [], "dataPoints": points}]}}
+
+
+class AnalyticsTests(unittest.TestCase):
+    START = datetime(2026, 11, 5, tzinfo=timezone.utc)
+    END = datetime(2026, 11, 9, tzinfo=timezone.utc)
+
+    def test_query_request_and_parsing(self):
+        session = FakeSession([FakeResponse(200, metric_response([
+            {"time": "2026-11-08T00:00:00Z", "value": 1350, "status": "Projected"},
+            {"time": "2026-11-07T00:00:00Z", "value": 1200.0, "status": "Valid"},
+        ]))])
+        points = bot.query_daily_metric(session, "42", "DailyActiveUsers", self.START, self.END)
+        self.assertEqual(points, [(date(2026, 11, 7), 1200.0, False), (date(2026, 11, 8), 1350.0, True)])
+        method, url, kwargs = session.calls[0]
+        self.assertEqual((method, url), ("POST", "https://apis.roblox.com/analytics-query-api/v1/universes/42/metrics"))
+        self.assertEqual(kwargs["json"], {
+            "metric": "DailyActiveUsers", "granularity": "OneDay",
+            "startTime": "2026-11-05T00:00:00Z", "endTime": "2026-11-09T00:00:00Z",
+        })
+
+    def test_long_running_query_is_polled(self):
+        path = "v1/universes/42/operations/metrics/op-1"
+        session = FakeSession([
+            FakeResponse(202, {"done": False, "path": path}),
+            FakeResponse(202, {"done": False, "path": path}),
+            FakeResponse(200, metric_response([{"time": "2026-11-08T00:00:00Z", "value": 7}])),
+        ])
+        sleeps = []
+        points = bot.query_daily_metric(session, "42", "DailyActiveUsers", self.START, self.END, sleep=sleeps.append)
+        self.assertEqual(points, [(date(2026, 11, 8), 7.0, False)])
+        self.assertEqual(session.calls[1][:2], ("GET", "https://apis.roblox.com/analytics-query-api/" + path))
+        self.assertEqual(sleeps, [bot.POLL_INTERVAL, bot.POLL_INTERVAL])
+
+    def test_failed_operation_raises(self):
+        session = FakeSession([FakeResponse(400, {"done": True, "error": {"code": 2001, "message": "bad metric"}})])
+        with self.assertRaises(bot.AnalyticsError) as caught:
+            bot.query_daily_metric(session, "42", "Nope", self.START, self.END)
+        self.assertIn("bad metric", str(caught.exception))
+        self.assertEqual(caught.exception.status, 400)
+
+    def campaigns(self):
+        return [
+            bot.Campaign("a", "Alpha", "ACTIVE", "SERVING", target_universe_id="42"),
+            bot.Campaign("b", "Beta", "ACTIVE", "IN_REVIEW", target_universe_id="42"),
+            bot.Campaign("c", "Old", "PAUSED", "NOT_SERVING", ["PAUSED"], target_universe_id="99"),
+        ]
+
+    def test_fetches_each_active_experience_once(self):
+        day_points = [{"time": "2026-11-07T00:00:00Z", "value": 10}, {"time": "2026-11-08T00:00:00Z", "value": 15}]
+        session = FakeSession([FakeResponse(200, metric_response(day_points))] * len(bot.GAME_METRICS))
+        stats = bot.fetch_game_stats(session, self.campaigns(), NOW, sleep=lambda _: None)
+        self.assertEqual(len(stats), 1)  # paused campaign's experience is skipped
+        self.assertEqual(stats[0].campaign_names, ["Alpha", "Beta"])
+        self.assertEqual(len(session.calls), len(bot.GAME_METRICS))
+        self.assertEqual(session.calls[0][2]["json"]["endTime"], "2026-11-09T00:00:00Z")  # today excluded
+        dau = stats[0].values["DailyActiveUsers"]
+        self.assertEqual((dau.day, dau.value, dau.previous), (date(2026, 11, 8), 15.0, 10.0))
+
+    def test_missing_permission_is_shown_and_stops_further_queries(self):
+        session = FakeSession([FakeResponse(403, {"errors": [{"message": "Insufficient permissions"}]})])
+        stats = bot.fetch_game_stats(session, self.campaigns(), NOW, sleep=lambda _: None)
+        self.assertEqual(len(session.calls), 1)
+        block = bot._game_block(stats[0])
+        self.assertIn("HTTP 403 Insufficient permissions", block)
+        self.assertIn("universe.analytics:read", block)
+
+    def test_block_format(self):
+        _, _, game_stats = bot._load_demo(False)
+        block = plain(bot._game_block(game_stats[0]))
+        self.assertIn("🎮 <b>נתוני המשחק</b> · Sky Tycoon - Winter Launch, Pet Simulator Promo", block)
+        self.assertIn("יום 08/11/2026 (UTC):", block)
+        self.assertIn("👥 משתמשים פעילים (DAU): 1,350 (+150 מהיום הקודם)", block)
+        self.assertIn("👁 ראו את המשחק (impressions): 48,210 (-2,790 מהיום הקודם)", block)
+        self.assertIn("🖱 נכנסו לדף המשחק (clicks): 2,105 (±0 מהיום הקודם)", block)
+        self.assertIn("🎮 שיחקו (plays): 1,412 (+122 מהיום הקודם) · משוער", block)
+        self.assertIn("לא רק מהפרסומת", block)
+
+    def test_game_stats_go_before_the_summary(self):
+        campaigns, previous, game_stats = bot._load_demo(False)
+        blocks = bot.build_report(campaigns, previous, NOW, game_stats=game_stats)
+        self.assertTrue(blocks[-3].startswith("🎮"))
+        self.assertTrue(blocks[-1].startswith("📋"))
+
+    def test_no_universe_no_calls(self):
+        session = FakeSession([])
+        self.assertEqual(bot.fetch_game_stats(session, [], NOW), [])
+
+
 class RepoHygieneTests(unittest.TestCase):
-    def test_bot_only_calls_read_endpoints(self):
+    def test_bot_never_writes_to_roblox(self):
         source = (bot.BASE_DIR / "roblox_ads_bot.py").read_text(encoding="utf-8")
-        calls = re.findall(r'request_with_retry\(\s*session,\s*"(\w+)",\s*(\w+)', source)
-        self.assertEqual(sorted(calls), [("GET", "url"), ("POST", "url")])  # Roblox GET, Telegram POST
         self.assertNotIn("ad.campaign:write", source)
+        self.assertNotIn('"PATCH"', source)
+        self.assertNotIn('"DELETE"', source)
+        # The only POSTs: Telegram sendMessage, and the Analytics *query* (a read).
+        posts = re.findall(r'"POST",\s*(url|f"[^"]*")', source)
+        self.assertEqual(len(posts), 2)
 
     def test_env_file_is_ignored_by_git(self):
         ignore = (bot.BASE_DIR / ".gitignore").read_text(encoding="utf-8").splitlines()
