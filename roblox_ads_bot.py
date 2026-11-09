@@ -159,15 +159,17 @@ class AnalyticsError(Exception):
 
 @dataclass
 class DailyValue:
-    day: date  # the UTC day the value belongs to
-    value: float
-    previous: float | None  # the day before, when Roblox returned it
+    day: date  # the UTC day the value belongs to (latest day Roblox has published)
+    value: float  # users who came from ads
+    previous: float | None  # same, the day before
     projected: bool = False
+    total: float | None = None  # all users that day, every source (for context)
 
 
 @dataclass
 class GameStats:
-    """Whole-experience daily numbers from the Analytics API (all traffic, not only ads)."""
+    """Daily numbers for one experience from the Analytics API, counting only
+    users who arrived through ads (see AD_SOURCES)."""
 
     universe_id: str
     campaign_names: list[str]
@@ -382,13 +384,18 @@ def fetch_campaign_metrics(session, campaigns: list[Campaign]) -> dict[str, Metr
 # --------------------------------------------------------------------------
 
 ANALYTICS_BASE = "https://apis.roblox.com/analytics-query-api"
-# (metric, emoji, Hebrew label). All support OneDay granularity.
+# (metric, emoji, Hebrew label). All support OneDay granularity and the
+# AcquisitionSource dimension.
 GAME_METRICS = (
-    ("DailyActiveUsers", "👥", "משתמשים פעילים (DAU)"),
-    ("UniqueUsersWithImpressions", "👁", "ראו את המשחק (impressions)"),
-    ("UniqueUsersWithClicks", "🖱", "נכנסו לדף המשחק (clicks)"),
+    ("UniqueUsersWithImpressions", "👁", "ראו את המשחק בפרסומת (impressions)"),
+    ("UniqueUsersWithClicks", "🖱", "לחצו ונכנסו לדף המשחק (clicks)"),
     ("UniqueUsersWithPlaySessions", "🎮", "שיחקו (plays)"),
+    ("DailyActiveUsers", "👥", "משתמשים פעילים (DAU)"),
 )
+# The ad values of the AcquisitionSource dimension. Not listed in the docs;
+# these are the values the dimension-values endpoint returned (2026-11-10),
+# next to non-ad ones such as Search, Friends, HomeRecommendation.
+AD_SOURCES = ("SponsoredAds", "SearchAds", "PortalAds")
 ANALYTICS_LOOKBACK_DAYS = 4  # enough to find the latest finished day and the one before it
 MAX_POLLS = 15
 POLL_INTERVAL = 2.0
@@ -416,8 +423,13 @@ def _analytics_call(session, method: str, url: str, *, sleep, **kwargs) -> dict:
 
 
 def query_daily_metric(session, universe_id: str, metric: str, start: datetime, end: datetime,
-                       *, sleep=time.sleep) -> list[tuple[date, float, bool]]:
-    """One metric at OneDay granularity: [(day, value, projected), ...] sorted by day."""
+                       *, sources: tuple[str, ...] | None = None,
+                       sleep=time.sleep) -> list[tuple[date, float, bool]]:
+    """One metric at OneDay granularity: [(day, value, projected), ...] sorted by day.
+
+    With `sources`, only users whose AcquisitionSource is one of them are
+    counted. Days with no such users are simply missing from the result.
+    """
     url = f"{ANALYTICS_BASE}/v1/universes/{universe_id}/metrics"
     body = {
         "metric": metric,
@@ -425,6 +437,8 @@ def query_daily_metric(session, universe_id: str, metric: str, start: datetime, 
         "startTime": start.isoformat().replace("+00:00", "Z"),
         "endTime": end.isoformat().replace("+00:00", "Z"),
     }
+    if sources:
+        body["filter"] = [{"dimension": "AcquisitionSource", "operation": "In", "values": list(sources)}]
     data = _analytics_call(session, "POST", url, json=body, sleep=sleep)
     for poll in range(MAX_POLLS + 1):  # long queries come back as 202 + a path to poll
         if data.get("done"):
@@ -449,7 +463,11 @@ def query_daily_metric(session, universe_id: str, metric: str, start: datetime, 
 
 
 def fetch_game_stats(session, campaigns: list[Campaign], now: datetime, *, sleep=time.sleep) -> list[GameStats]:
-    """Daily DAU / impressions / clicks / plays for each experience an active campaign promotes.
+    """Daily impressions / clicks / plays / DAU from ads, for each experience an active campaign promotes.
+
+    Two queries per metric: one unfiltered, to learn the latest day Roblox has
+    published (and the all-sources total), and one filtered to AD_SOURCES. A
+    published day missing from the filtered result means zero users from ads.
 
     A failure here (for example a key without universe.analytics:read) is kept
     on the GameStats and shown in the report; it never stops the campaign report.
@@ -467,20 +485,25 @@ def fetch_game_stats(session, campaigns: list[Campaign], now: datetime, *, sleep
     for stats in universes.values():
         for metric, _, _ in GAME_METRICS:
             try:
-                points = query_daily_metric(session, stats.universe_id, metric, start, end, sleep=sleep)
+                all_points = query_daily_metric(session, stats.universe_id, metric, start, end, sleep=sleep)
+                if not all_points:
+                    continue  # nothing published for this window yet
+                ad_points = query_daily_metric(
+                    session, stats.universe_id, metric, start, end, sources=AD_SOURCES, sleep=sleep
+                )
             except AnalyticsError as error:
                 stats.error = error
                 break  # same key, same experience: the other metrics would fail the same way
             except (KeyError, TypeError, ValueError, AttributeError):
                 stats.error = AnalyticsError("תשובה לא צפויה מה-Analytics API")
                 break
-            if not points:
-                continue
-            day, value, projected = points[-1]
+            day, total, _ = all_points[-1]
+            from_ads = {d: (v, p) for d, v, p in ad_points}
+            value, projected = from_ads.get(day, (0.0, False))
             previous = None
-            if len(points) > 1 and points[-2][0] == day - timedelta(days=1):
-                previous = points[-2][1]
-            stats.values[metric] = DailyValue(day, value, previous, projected)
+            if day - timedelta(days=1) >= start.date():
+                previous = from_ads.get(day - timedelta(days=1), (0.0, False))[0]
+            stats.values[metric] = DailyValue(day, value, previous, projected, total)
     return list(universes.values())
 
 
@@ -796,7 +819,7 @@ def _summary_block(shown: list[Campaign], hidden: int, previous: Snapshot | None
         if parts:
             lines.append(" · ".join(parts))
     else:
-        lines.append("ℹ️ הוצאה, חשיפות, כניסות ו-CTR: Roblox עדיין לא חושפת מדדי קמפיין ב-API.")
+        lines.append("ℹ️ הוצאה ומדדים לפי קמפיין בודד: Roblox עדיין לא חושפת אותם ב-API.")
 
     if hidden:
         lines.append(f"לא מוצגים: {hidden} קמפיינים לא פעילים (מושהים, מבוטלים או שהסתיימו)")
@@ -813,7 +836,7 @@ def _fmt_count(value: float) -> str:
 
 
 def _game_block(stats: GameStats) -> str:
-    lines = ["🎮 <b>נתוני המשחק</b> · " + esc(", ".join(stats.campaign_names))]
+    lines = ["📣 <b>תנועה מפרסומות</b> · " + esc(", ".join(stats.campaign_names))]
     if stats.error is not None:
         lines.append(f"⚠️ לא זמין: {esc(stats.error)}")
         if stats.error.status in (401, 403):
@@ -834,12 +857,14 @@ def _game_block(stats: GameStats) -> str:
             diff = item.value - item.previous
             sign = "+" if diff > 0 else ("-" if diff < 0 else "±")
             line += " (" + ltr(f"{sign}{_fmt_count(abs(diff))}") + " מהיום הקודם)"
+        if item.total is not None:
+            line += f" · מתוך {_fmt_count(item.total)} מכל המקורות"
         if item.day != latest:
             line += f" · נכון ל-{item.day.strftime('%d/%m')}"
         if item.projected:
             line += " · משוער"
         lines.append(line)
-    lines.append("ℹ️ משתמשים ייחודיים מכל המקורות, לא רק מהפרסומת. מתעדכן פעם ביום.")
+    lines.append("ℹ️ משתמשים ייחודיים שהגיעו דרך פרסומות (Sponsored, Search, Portal). Roblox מעדכנת את הנתונים פעם ביום.")
     return "\n".join(lines)
 
 
@@ -1050,10 +1075,10 @@ def _load_demo(with_metrics: bool) -> tuple[list[Campaign], Snapshot | None, lis
     day = date(2026, 11, 8)
     game_stats = [
         GameStats("1111111111", ["Sky Tycoon - Winter Launch", "Pet Simulator Promo"], {
-            "DailyActiveUsers": DailyValue(day, 1350, 1200),
-            "UniqueUsersWithImpressions": DailyValue(day, 48210, 51000),
-            "UniqueUsersWithClicks": DailyValue(day, 2105, 2105),
-            "UniqueUsersWithPlaySessions": DailyValue(day, 1412, 1290, projected=True),
+            "UniqueUsersWithImpressions": DailyValue(day, 48210, 51000, total=96400),
+            "UniqueUsersWithClicks": DailyValue(day, 2105, 2105, total=5300),
+            "UniqueUsersWithPlaySessions": DailyValue(day, 1412, 1290, projected=True, total=3900),
+            "DailyActiveUsers": DailyValue(day - timedelta(days=1), 1350, 1200, total=4100),
         }),
         GameStats("3333333333", ["Tower Defense Evergreen"],
                   error=AnalyticsError("HTTP 403 Insufficient permissions", 403)),

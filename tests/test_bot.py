@@ -187,7 +187,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("🕒 01/07/2026 15:00", "\n".join(bot.build_report([], None, summer)))  # UTC+3
 
     def test_says_metrics_are_unavailable_instead_of_inventing_them(self):
-        self.assertIn("Roblox עדיין לא חושפת מדדי קמפיין ב-API", self.report)
+        self.assertIn("הוצאה ומדדים לפי קמפיין בודד: Roblox עדיין לא חושפת אותם ב-API", self.report)
         self.assertNotIn("הוצאה:", self.report)
 
     def test_no_active_campaigns(self):
@@ -512,6 +512,14 @@ class AnalyticsTests(unittest.TestCase):
             "startTime": "2026-11-05T00:00:00Z", "endTime": "2026-11-09T00:00:00Z",
         })
 
+    def test_ads_filter_is_sent(self):
+        session = FakeSession([FakeResponse(200, metric_response([]))])
+        bot.query_daily_metric(session, "42", "UniqueUsersWithPlaySessions", self.START, self.END, sources=bot.AD_SOURCES)
+        self.assertEqual(session.calls[0][2]["json"]["filter"], [{
+            "dimension": "AcquisitionSource", "operation": "In",
+            "values": ["SponsoredAds", "SearchAds", "PortalAds"],
+        }])
+
     def test_long_running_query_is_polled(self):
         path = "v1/universes/42/operations/metrics/op-1"
         session = FakeSession([
@@ -539,16 +547,37 @@ class AnalyticsTests(unittest.TestCase):
             bot.Campaign("c", "Old", "PAUSED", "NOT_SERVING", ["PAUSED"], target_universe_id="99"),
         ]
 
-    def test_fetches_each_active_experience_once(self):
-        day_points = [{"time": "2026-11-07T00:00:00Z", "value": 10}, {"time": "2026-11-08T00:00:00Z", "value": 15}]
-        session = FakeSession([FakeResponse(200, metric_response(day_points))] * len(bot.GAME_METRICS))
+    def test_counts_only_ad_users_on_the_latest_published_day(self):
+        all_points = [{"time": "2026-11-07T00:00:00Z", "value": 10}, {"time": "2026-11-08T00:00:00Z", "value": 15}]
+        ad_points = [{"time": "2026-11-07T00:00:00Z", "value": 3}, {"time": "2026-11-08T00:00:00Z", "value": 5}]
+        script = []
+        for _ in bot.GAME_METRICS:  # per metric: the unfiltered query, then the ads-only one
+            script += [FakeResponse(200, metric_response(all_points)), FakeResponse(200, metric_response(ad_points))]
+        session = FakeSession(script)
         stats = bot.fetch_game_stats(session, self.campaigns(), NOW, sleep=lambda _: None)
         self.assertEqual(len(stats), 1)  # paused campaign's experience is skipped
         self.assertEqual(stats[0].campaign_names, ["Alpha", "Beta"])
-        self.assertEqual(len(session.calls), len(bot.GAME_METRICS))
+        self.assertEqual(len(session.calls), 2 * len(bot.GAME_METRICS))
+        self.assertNotIn("filter", session.calls[0][2]["json"])
+        self.assertIn("filter", session.calls[1][2]["json"])
         self.assertEqual(session.calls[0][2]["json"]["endTime"], "2026-11-09T00:00:00Z")  # today excluded
-        dau = stats[0].values["DailyActiveUsers"]
-        self.assertEqual((dau.day, dau.value, dau.previous), (date(2026, 11, 8), 15.0, 10.0))
+        plays = stats[0].values["UniqueUsersWithPlaySessions"]
+        self.assertEqual((plays.day, plays.value, plays.previous, plays.total), (date(2026, 11, 8), 5.0, 3.0, 15.0))
+
+    def test_published_day_without_ad_users_is_zero(self):
+        all_points = [{"time": "2026-11-07T00:00:00Z", "value": 10}, {"time": "2026-11-08T00:00:00Z", "value": 15}]
+        script = []
+        for _ in bot.GAME_METRICS:
+            script += [FakeResponse(200, metric_response(all_points)), FakeResponse(200, metric_response([]))]
+        stats = bot.fetch_game_stats(FakeSession(script), self.campaigns(), NOW, sleep=lambda _: None)
+        plays = stats[0].values["UniqueUsersWithPlaySessions"]
+        self.assertEqual((plays.day, plays.value, plays.previous, plays.total), (date(2026, 11, 8), 0.0, 0.0, 15.0))
+
+    def test_nothing_published_skips_the_ads_query(self):
+        session = FakeSession([FakeResponse(200, metric_response([]))] * len(bot.GAME_METRICS))
+        stats = bot.fetch_game_stats(session, self.campaigns(), NOW, sleep=lambda _: None)
+        self.assertEqual(len(session.calls), len(bot.GAME_METRICS))
+        self.assertIn("אין עדיין נתונים", bot._game_block(stats[0]))
 
     def test_missing_permission_is_shown_and_stops_further_queries(self):
         session = FakeSession([FakeResponse(403, {"errors": [{"message": "Insufficient permissions"}]})])
@@ -561,18 +590,21 @@ class AnalyticsTests(unittest.TestCase):
     def test_block_format(self):
         _, _, game_stats = bot._load_demo(False)
         block = plain(bot._game_block(game_stats[0]))
-        self.assertIn("🎮 <b>נתוני המשחק</b> · Sky Tycoon - Winter Launch, Pet Simulator Promo", block)
+        self.assertIn("📣 <b>תנועה מפרסומות</b> · Sky Tycoon - Winter Launch, Pet Simulator Promo", block)
         self.assertIn("יום 08/11/2026 (UTC):", block)
-        self.assertIn("👥 משתמשים פעילים (DAU): 1,350 (+150 מהיום הקודם)", block)
-        self.assertIn("👁 ראו את המשחק (impressions): 48,210 (-2,790 מהיום הקודם)", block)
-        self.assertIn("🖱 נכנסו לדף המשחק (clicks): 2,105 (±0 מהיום הקודם)", block)
-        self.assertIn("🎮 שיחקו (plays): 1,412 (+122 מהיום הקודם) · משוער", block)
-        self.assertIn("לא רק מהפרסומת", block)
+        self.assertIn("👁 ראו את המשחק בפרסומת (impressions): 48,210 (-2,790 מהיום הקודם) · מתוך 96,400 מכל המקורות", block)
+        self.assertIn("🖱 לחצו ונכנסו לדף המשחק (clicks): 2,105 (±0 מהיום הקודם) · מתוך 5,300", block)
+        self.assertIn("🎮 שיחקו (plays): 1,412 (+122 מהיום הקודם) · מתוך 3,900 מכל המקורות · משוער", block)
+        self.assertIn("👥 משתמשים פעילים (DAU): 1,350 (+150 מהיום הקודם) · מתוך 4,100 מכל המקורות · נכון ל-07/11", block)
+        self.assertIn("שהגיעו דרך פרסומות", block)
+        lines = block.splitlines()  # impressions -> clicks -> plays -> DAU, the funnel order
+        self.assertLess(lines.index(next(l for l in lines if l.startswith("👁"))),
+                        lines.index(next(l for l in lines if l.startswith("👥"))))
 
     def test_game_stats_go_before_the_summary(self):
         campaigns, previous, game_stats = bot._load_demo(False)
         blocks = bot.build_report(campaigns, previous, NOW, game_stats=game_stats)
-        self.assertTrue(blocks[-3].startswith("🎮"))
+        self.assertTrue(blocks[-3].startswith("📣"))
         self.assertTrue(blocks[-1].startswith("📋"))
 
     def test_no_universe_no_calls(self):
