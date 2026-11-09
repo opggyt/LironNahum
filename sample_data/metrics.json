@@ -1,0 +1,30 @@
+{
+  "_comment": "Made-up numbers in the bot's own internal format. This is NOT a Roblox API response: Roblox has no campaign-metrics endpoint yet. Used only by --demo-metrics and the tests.",
+  "c-1001": {
+    "spendMicros": "123456789",
+    "spendTodayMicros": "12500000",
+    "impressions": 250000,
+    "clicks": 5000,
+    "plays": 1800
+  },
+  "c-1002": {
+    "spendMicros": "0",
+    "impressions": 0,
+    "clicks": 0,
+    "plays": 0
+  },
+  "c-1003": {
+    "spendMicros": "45000000",
+    "spendTodayMicros": "0",
+    "impressions": 90000,
+    "clicks": 900,
+    "plays": 300
+  },
+  "c-1006": {
+    "spendMicros": "1234567890",
+    "spendTodayMicros": "75500000",
+    "impressions": 3000000,
+    "clicks": 45000,
+    "plays": 20000
+  }
+}

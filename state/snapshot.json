@@ -1,0 +1,16 @@
+{
+  "campaigns": {
+    "6bc140bb-6020-447c-af96-13c5d2d2d3eb": {
+      "budgetMicros": "9000000",
+      "budgetType": "LIFETIME",
+      "deliveryStatus": "SERVING",
+      "deliveryStatusReasons": [
+        "LEARNING"
+      ],
+      "name": "Mine in the Sky! - Beta Test 01",
+      "status": "ACTIVE"
+    }
+  },
+  "generatedAt": "2026-11-09T22:01:12+00:00",
+  "version": 1
+}

@@ -1,0 +1,3 @@
+requests>=2.31
+# Windows has no built-in time zone database (needed for Asia/Jerusalem).
+tzdata; sys_platform == "win32"

@@ -1,0 +1,15 @@
+# Secrets: never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Temp file of an interrupted snapshot write
+state/*.tmp
+
+# Note: state/snapshot.json is committed on purpose (the workflow keeps it up to date).

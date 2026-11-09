@@ -1,0 +1,68 @@
+{
+  "_comment": "Made-up data in the shape of GET /ads-management/v1/campaigns. Used by --demo and the tests.",
+  "campaigns": [
+    {
+      "id": "c-1001",
+      "name": "Sky Tycoon - Winter Launch",
+      "status": "ACTIVE",
+      "deliveryStatus": "SERVING",
+      "deliveryStatusReasons": ["LEARNING"],
+      "objective": "ENGAGEMENT",
+      "targetUniverseId": "1111111111",
+      "budget": { "type": "DAILY", "amountMicros": "50000000" }
+    },
+    {
+      "id": "c-1002",
+      "name": "Obby Rush <Season 2> & Friends",
+      "status": "ACTIVE",
+      "deliveryStatus": "IN_REVIEW",
+      "objective": "ENGAGEMENT",
+      "targetUniverseId": "2222222222",
+      "budget": { "type": "LIFETIME", "amountMicros": "500000000" }
+    },
+    {
+      "id": "c-1003",
+      "name": "Pet Simulator Promo",
+      "status": "ACTIVE",
+      "deliveryStatus": "REJECTED",
+      "deliveryStatusReasons": ["MODERATED"],
+      "objective": "ENGAGEMENT",
+      "targetUniverseId": "1111111111",
+      "budget": { "type": "DAILY", "amountMicros": "20000000" }
+    },
+    {
+      "id": "c-1004",
+      "name": "Halloween Event",
+      "status": "PAUSED",
+      "deliveryStatus": "NOT_SERVING",
+      "deliveryStatusReasons": ["PAUSED"],
+      "objective": "ENGAGEMENT",
+      "targetUniverseId": "2222222222",
+      "budget": { "type": "DAILY", "amountMicros": "10000000" }
+    },
+    {
+      "id": "c-1005",
+      "name": "Summer Sale 2026",
+      "status": "ACTIVE",
+      "deliveryStatus": "NOT_SERVING",
+      "deliveryStatusReasons": ["COMPLETED"],
+      "objective": "ENGAGEMENT",
+      "targetUniverseId": "1111111111",
+      "budget": { "type": "LIFETIME", "amountMicros": "100000000" }
+    },
+    {
+      "id": "c-1006",
+      "name": "Tower Defense Evergreen",
+      "status": "ACTIVE",
+      "deliveryStatus": "SERVING",
+      "objective": "ENGAGEMENT",
+      "targetUniverseId": "3333333333",
+      "budget": {
+        "type": "DAILY",
+        "amountMicros": "75500000",
+        "scheduledAmountMicros": "60000000",
+        "scheduledEffectiveTime": "2026-11-09T22:00:00Z"
+      }
+    }
+  ]
+}

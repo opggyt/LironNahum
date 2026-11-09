@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "generatedAt": "2026-11-09T09:00:00+00:00",
+  "campaigns": {
+    "c-1001": {
+      "name": "Sky Tycoon - Winter Launch",
+      "status": "ACTIVE",
+      "deliveryStatus": "IN_REVIEW",
+      "deliveryStatusReasons": [],
+      "budgetType": "DAILY",
+      "budgetMicros": "30000000"
+    },
+    "c-1003": {
+      "name": "Pet Simulator Promo",
+      "status": "ACTIVE",
+      "deliveryStatus": "SERVING",
+      "deliveryStatusReasons": [],
+      "budgetType": "DAILY",
+      "budgetMicros": "20000000"
+    },
+    "c-1004": {
+      "name": "Halloween Event",
+      "status": "ACTIVE",
+      "deliveryStatus": "SERVING",
+      "deliveryStatusReasons": [],
+      "budgetType": "DAILY",
+      "budgetMicros": "10000000"
+    },
+    "c-1005": {
+      "name": "Summer Sale 2026",
+      "status": "ACTIVE",
+      "deliveryStatus": "NOT_SERVING",
+      "deliveryStatusReasons": ["COMPLETED"],
+      "budgetType": "LIFETIME",
+      "budgetMicros": "100000000"
+    },
+    "c-1006": {
+      "name": "Tower Defense Evergreen",
+      "status": "ACTIVE",
+      "deliveryStatus": "SERVING",
+      "deliveryStatusReasons": [],
+      "budgetType": "DAILY",
+      "budgetMicros": "75500000"
+    }
+  }
+}

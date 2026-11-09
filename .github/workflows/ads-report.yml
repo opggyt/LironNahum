@@ -1,0 +1,66 @@
+name: Roblox Ads report
+
+on:
+  schedule:
+    - cron: "0 */3 * * *" # every 3 hours, on the hour (UTC). GitHub may start it a few minutes late.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the message in the log instead of sending it"
+        type: boolean
+        default: false
+
+# Needed to commit state/snapshot.json back to the repository.
+permissions:
+  contents: write
+
+# Never run two reports at once: they would race on the snapshot commit.
+concurrency:
+  group: roblox-ads-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build and send the report
+        env:
+          ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ROBLOX_GROUP_ID: ${{ vars.ROBLOX_GROUP_ID }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python roblox_ads_bot.py --dry-run
+          else
+            python roblox_ads_bot.py
+          fi
+
+      # Runs only if the report was sent. The snapshot is what the next run
+      # compares against ("change since the previous report").
+      - name: Save snapshot for the next run
+        run: |
+          if [ ! -f state/snapshot.json ]; then
+            echo "No snapshot written (dry run). Nothing to save."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/snapshot.json
+          if git diff --cached --quiet; then
+            echo "Snapshot unchanged."
+            exit 0
+          fi
+          git commit -m "Update campaign snapshot [skip ci]"
+          git push || { git pull --rebase && git push; }
