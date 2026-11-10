@@ -4,13 +4,11 @@
       "budgetMicros": "9000000",
       "budgetType": "LIFETIME",
       "deliveryStatus": "SERVING",
-      "deliveryStatusReasons": [
-        "LEARNING"
-      ],
+      "deliveryStatusReasons": [],
       "name": "Mine in the Sky! - Beta Test 01",
       "status": "ACTIVE"
     }
   },
-  "generatedAt": "2026-11-10T14:05:37+00:00",
+  "generatedAt": "2026-11-10T21:08:38+00:00",
   "version": 1
 }
